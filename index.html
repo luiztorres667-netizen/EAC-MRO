@@ -3539,7 +3539,7 @@
             </div>
             <div class="sub-tab" onclick="switchSub('emp','devol',this)">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
-              Devoluções
+              Devoluções <span class="tab-count tab-count-verde" id="tab-devol-count" style="display:none">0</span>
             </div>
           </div>
 
@@ -5242,8 +5242,8 @@
   let extDias  = 3;
   let extMotivo = '';
 
-  function abrirExtensao(cardId, codigo, material, email, nome, prazoISO) {
-    extAtual  = { cardId, codigo, material, email, nome, prazoISO };
+  function abrirExtensao(cardId, codigo, material, email, nome, prazoISO, firestoreId) {
+    extAtual  = { cardId, codigo, material, email, nome, prazoISO, firestoreId: firestoreId || null };
     extDias   = 3;
     extMotivo = '';
 
@@ -5401,6 +5401,71 @@ Atenciosamente,<br><strong>Luiz Torres — Admin · Controle Dressing · MRO</st
 
       // Atualiza prazo no formulário de devolução para refletir novo prazo
       extAtual.prazoISO = novaISO;
+
+      // Atualiza a contagem de dias no card DOM
+      if (card) {
+        const prazoInfoDivs = card.querySelectorAll('.pedido-info > div');
+        prazoInfoDivs.forEach(div => {
+          const lbl = div.querySelector('.info-label');
+          if (lbl && lbl.textContent.trim() === 'Prazo') {
+            const val = div.querySelector('.info-value');
+            if (val) val.innerHTML = renderContagemDias(novaISO);
+          }
+        });
+      }
+
+      // Persiste extensão no Firestore
+      if (extAtual.firestoreId) {
+        const novaFmtLonga = novaPrazo.toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'});
+        _db().collection('pedidos_eac').doc(extAtual.firestoreId).update({
+          devISO: novaISO,
+          devFmt: novaFmtLonga,
+          prazoEstendidoEm: firebase.firestore.FieldValue.serverTimestamp(),
+          prazoEstendidoPor: sessaoAtual?.nome || 'Admin'
+        }).catch(e => console.error('Erro ao salvar extensão:', e));
+      }
+
+      // Notifica todos os Gestores e Admins via Firestore
+      (async () => {
+        try {
+          const gestoresSnap = await _db().collection('usuarios')
+            .where('cargo', 'in', ['Admin', 'Gestor']).get();
+          const dadosG = {
+            nome: extAtual.nome, codigo: extAtual.codigo, material: extAtual.material,
+            dias: extDias,
+            novaFmtCurto: novaFmt,
+            velhaFmtCurto: prazo.toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'})
+          };
+          const motivoKey = extMotivo || 'Outro';
+          const msgG = (msgsGestorPorMotivo[motivoKey] || msgsGestorPorMotivo['Outro'])(dadosG);
+          gestoresSnap.docs.forEach(doc => {
+            const gEmail = doc.data().email;
+            if (!gEmail) return;
+            _db().collection('notificacoes').add({
+              paraEmail: gEmail,
+              iconClass: 'notif-icon alerta',
+              titulo: '📅 Prazo estendido — ' + extAtual.material,
+              sub: msgG,
+              onclick: "irParaNotif('eac','emp','aprov')",
+              lida: false,
+              criadoEm: firebase.firestore.FieldValue.serverTimestamp()
+            }).catch(() => {});
+          });
+
+          // Também notifica o concedente/pedinte diretamente
+          if (extAtual.email) {
+            _db().collection('notificacoes').add({
+              paraEmail: extAtual.email,
+              iconClass: 'notif-icon alerta',
+              titulo: '📅 Seu prazo foi estendido — ' + extAtual.material,
+              sub: `O prazo de devolução do pedido #${extAtual.codigo} foi estendido por ${extDias} dia(s). Novo prazo: ${novaFmt}.`,
+              onclick: "irParaNotif('eac','emp','liberados')",
+              lida: false,
+              criadoEm: firebase.firestore.FieldValue.serverTimestamp()
+            }).catch(() => {});
+          }
+        } catch(e) { console.error('Erro ao notificar gestores sobre extensão:', e); }
+      })();
     }
 
     // Notificação ao gestor com mensagem por motivo
@@ -8278,25 +8343,27 @@ Atenciosamente,<br><strong>Luiz Torres — Admin · Controle Dressing · MRO</st
     } catch(e) { console.error('Erro ao carregar permissões:', e); }
   }
 
-  async function _carregarNotificacoes(email) {
-    try {
-      const snap = await _db().collection('notificacoes')
-        .where('paraEmail', '==', email)
-        .where('lida', '==', false)
-        .get();
-
-      snap.docs.forEach(d => {
-        const n = d.data();
-        adicionarNotif(
-          n.iconClass || 'notif-icon pedido',
-          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
-          n.titulo,
-          n.sub,
-          n.onclick || null
-        );
-        d.ref.update({ lida: true }).catch(() => {});
-      });
-    } catch(e) { console.error('Erro ao carregar notificações:', e); }
+  let _unsubNotif = null;
+  function _carregarNotificacoes(email) {
+    if (_unsubNotif) _unsubNotif();
+    _unsubNotif = _db().collection('notificacoes')
+      .where('paraEmail', '==', email)
+      .where('lida', '==', false)
+      .onSnapshot(snap => {
+        snap.docChanges().forEach(change => {
+          if (change.type !== 'added') return;
+          const d = change.doc;
+          const n = d.data();
+          adicionarNotif(
+            n.iconClass || 'notif-icon pedido',
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+            n.titulo,
+            n.sub,
+            n.onclick || null
+          );
+          d.ref.update({ lida: true }).catch(() => {});
+        });
+      }, e => console.error('Erro ao ouvir notificações:', e));
   }
 
   // ── Carregar pedidos do próprio usuário (como solicitante) ──
@@ -8604,6 +8671,8 @@ Atenciosamente,<br><strong>Luiz Torres — Admin · Controle Dressing · MRO</st
         lista.appendChild(card);
       });
 
+      const cDevol = document.getElementById('tab-devol-count');
+      if (cDevol && docs.length > 0) { cDevol.textContent = docs.length; cDevol.style.display = ''; }
       _renderizarPaginacao('lista-devolvidos');
     } catch(e) { console.error('Erro ao carregar devoluções:', e); }
   }
@@ -8677,6 +8746,10 @@ Atenciosamente,<br><strong>Luiz Torres — Admin · Controle Dressing · MRO</st
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
               Detalhes
             </button>
+            <button class="btn btn-ghost btn-sm" onclick="abrirExtensao('${cardId}','${p.codigo}','${(p.produto||'').replace(/'/g,"\\'")}','${p.solicitanteEmail}','${(p.solicitanteNome||'').replace(/'/g,"\\'")}','${p.devISO}','${d.id}')">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              Estender prazo
+            </button>
             <button class="btn btn-green ${aguardandoDevol ? '' : 'btn-sm'}" onclick="confirmarDevolucaoFS('${d.id}','${cardId}','${p.codigo}','${p.solicitanteEmail}')">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
               Confirmar devolução
@@ -8701,6 +8774,8 @@ Atenciosamente,<br><strong>Luiz Torres — Admin · Controle Dressing · MRO</st
           });
         }
       });
+      const cAprov = document.getElementById('tab-aprov-count');
+      if (cAprov) cAprov.textContent = docs.length;
       _renderizarPaginacao('lista-aprovados');
     } catch(e) { console.error('Erro ao carregar pedidos aprovados:', e); }
   }
